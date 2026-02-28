@@ -96,6 +96,7 @@ class TTSAudioTrack(AudioStreamTrack):
         self._queue: asyncio.Queue[av.AudioFrame] = asyncio.Queue()
         self._pts = 0
         self._start_time: float | None = None
+        self._interrupted = False
         # aiortc Opus encoder requires interleaved s16 format
         self._resampler = av.AudioResampler(format="s16", layout="stereo", rate=WEBRTC_SAMPLE_RATE)
 
@@ -115,10 +116,13 @@ class TTSAudioTrack(AudioStreamTrack):
         if wait > 0:
             await asyncio.sleep(wait)
 
-        try:
-            frame = self._queue.get_nowait()
-        except asyncio.QueueEmpty:
+        if self._interrupted:
             frame = self._silence_frame()
+        else:
+            try:
+                frame = self._queue.get_nowait()
+            except asyncio.QueueEmpty:
+                frame = self._silence_frame()
 
         # Convert fltp → s16 (required by aiortc Opus encoder)
         frames = self._resampler.resample(frame)
@@ -138,7 +142,7 @@ class TTSAudioTrack(AudioStreamTrack):
     async def push_pcm(self, pcm_bytes: bytes, sample_rate: int = TTS_INPUT_SAMPLE_RATE,
                         channels: int = 1) -> None:
         """Resample TTS output, convert to stereo 48kHz, chunk into frames, enqueue."""
-        if not pcm_bytes:
+        if not pcm_bytes or self._interrupted:
             return
 
         # Resample to 48kHz
@@ -169,6 +173,15 @@ class TTSAudioTrack(AudioStreamTrack):
         """Wait until all queued audio frames have been sent via recv()."""
         while not self._queue.empty():
             await asyncio.sleep(0.05)
+
+    def interrupt(self) -> None:
+        """Set interrupted flag and clear queue for immediate silence."""
+        self._interrupted = True
+        self.clear_queue()
+
+    def reset_interrupt(self) -> None:
+        """Reset interrupted flag to allow audio playback again."""
+        self._interrupted = False
 
     def clear_queue(self) -> None:
         """Discard queued audio (for interruption handling)."""

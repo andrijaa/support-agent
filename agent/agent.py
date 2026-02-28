@@ -58,6 +58,7 @@ class SupportAgent:
         self._is_speaking = False
         self._started = False
         self._conversation_ended = False
+        self._pending_confirmation = False
         self._done_event = asyncio.Event()
         self._speech_start_time: float = 0.0  # when first audio chunk started playing
 
@@ -79,21 +80,22 @@ class SupportAgent:
         await self._stt.send_audio(pcm_bytes)
 
     async def _on_speech_started(self) -> None:
-        """Deepgram VAD detected the user started speaking — barge-in."""
-        import time
-        if not self._is_speaking:
-            return
-        if time.monotonic() - self._speech_start_time < 0.5:
-            return
-        logger.info("Barge-in detected (VAD) — interrupting agent")
-        self._interrupt()
+        """Deepgram VAD detected the user started speaking.
+
+        VAD alone is unreliable for barge-in because the agent's own TTS
+        audio loops back through the user's microphone and triggers false
+        positives.  We only use VAD as a hint — actual interruption happens
+        in _on_transcript once Deepgram produces a real transcript.
+        """
+        if self._is_speaking:
+            logger.debug("VAD speech_started while agent speaking (waiting for transcript to confirm)")
 
     async def _on_transcript(self, text: str, is_final: bool) -> None:
         if is_final and text.strip():
-            # If agent is speaking and we get a real transcript, treat as barge-in.
-            # This catches cases where SpeechStarted fired during the grace period.
+            # A real transcript while the agent is speaking = genuine barge-in.
+            # This is more reliable than VAD alone, which fires on echo/noise.
             if self._is_speaking:
-                logger.info("Barge-in detected (transcript) — interrupting agent")
+                logger.info("Barge-in detected (transcript: '%s') — interrupting agent", text.strip())
                 self._interrupt()
             self._transcript_buffer.append(text.strip())
             logger.info("STT final: %s", text)
@@ -112,9 +114,9 @@ class SupportAgent:
 
     def _interrupt(self) -> None:
         """Cancel in-progress LLM/TTS and clear audio queue."""
+        self._tts_track.interrupt()  # immediately stop playback + block new pushes
         if self._llm_task and not self._llm_task.done():
             self._llm_task.cancel()
-        self._tts_track.clear_queue()
         self._is_speaking = False
 
     def _on_first_audio(self) -> None:
@@ -127,6 +129,7 @@ class SupportAgent:
     async def _process_turn(self, user_text: str) -> None:
         """LLM -> TTS streaming pipeline for one conversation turn."""
         try:
+            self._tts_track.reset_interrupt()
             logger.info("Processing turn: %s", user_text)
             await self._tts.stream_to_track(
                 self._llm.stream_chat(user_text),
@@ -136,8 +139,17 @@ class SupportAgent:
             # Wait for extraction to finish before checking completeness
             await self._llm.await_extraction()
             if self._llm.ticket.is_complete() and not self._llm.ticket.resolved:
-                self._llm.ticket.resolved = True
-                await self._on_ticket_complete()
+                if self._pending_confirmation:
+                    # User responded after confirmation — complete the ticket
+                    self._llm.ticket.resolved = True
+                    await self._on_ticket_complete()
+                else:
+                    # First time all fields are filled — let LLM ask for confirmation
+                    self._pending_confirmation = True
+                    logger.info("Ticket data complete, awaiting user confirmation")
+            elif not self._llm.ticket.is_complete():
+                # User changed something, reset confirmation
+                self._pending_confirmation = False
         except asyncio.CancelledError:
             logger.info("Turn processing cancelled (barge-in)")
         except Exception as e:
@@ -151,6 +163,7 @@ class SupportAgent:
             yield text
 
         try:
+            self._tts_track.reset_interrupt()
             await self._tts.stream_to_track(
                 _single_text(),
                 self._tts_track,
@@ -173,13 +186,8 @@ class SupportAgent:
         await self._send_conversation_data()
         await self.save_conversation()
 
-        # Say goodbye, wait for audio to finish, then signal done
+        # Wait for LLM's farewell to finish playing, then signal done
         self._conversation_ended = True
-        await self._respond(
-            "I've created a support ticket for your issue. "
-            "Our team will look into it and get back to you as soon as possible. "
-            "Thank you for contacting us, and have a great day! Goodbye."
-        )
         await self._tts_track.drain()
         await asyncio.sleep(0.5)  # small buffer for last RTP packets
         logger.info("Conversation ended, signalling shutdown")
