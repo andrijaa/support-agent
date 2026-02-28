@@ -68,7 +68,7 @@ async def run(args: argparse.Namespace) -> None:
     print(f"Support agent '{args.id}' connected to room '{args.room}'")
     print("Press Ctrl+C to stop.\n")
 
-    # Wait until interrupted
+    # Wait until interrupted or conversation ends naturally
     stop_event = asyncio.Event()
 
     def _handle_signal():
@@ -78,7 +78,12 @@ async def run(args: argparse.Namespace) -> None:
     for sig in (signal.SIGINT, signal.SIGTERM):
         loop.add_signal_handler(sig, _handle_signal)
 
-    await stop_event.wait()
+    # Complete when either Ctrl+C or agent finishes the conversation
+    done = asyncio.create_task(agent._done_event.wait())
+    stop = asyncio.create_task(stop_event.wait())
+    await asyncio.wait([done, stop], return_when=asyncio.FIRST_COMPLETED)
+    done.cancel()
+    stop.cancel()
 
     print("\nShutting down...")
     await agent.stop()

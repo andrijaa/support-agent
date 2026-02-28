@@ -95,11 +95,26 @@ class TTSAudioTrack(AudioStreamTrack):
         super().__init__()
         self._queue: asyncio.Queue[av.AudioFrame] = asyncio.Queue()
         self._pts = 0
+        self._start_time: float | None = None
         # aiortc Opus encoder requires interleaved s16 format
         self._resampler = av.AudioResampler(format="s16", layout="stereo", rate=WEBRTC_SAMPLE_RATE)
 
     async def recv(self) -> av.AudioFrame:
-        """Called by aiortc to get the next audio frame."""
+        """Called by aiortc to get the next audio frame.
+
+        Paces output at real-time rate (one 20ms frame per 20ms) so that
+        RTP packets are not sent in bursts that overwhelm the receiver.
+        """
+        loop = asyncio.get_event_loop()
+        if self._start_time is None:
+            self._start_time = loop.time()
+
+        # Wait until this frame's wall-clock delivery time
+        target_time = self._start_time + (self._pts / WEBRTC_SAMPLE_RATE)
+        wait = target_time - loop.time()
+        if wait > 0:
+            await asyncio.sleep(wait)
+
         try:
             frame = self._queue.get_nowait()
         except asyncio.QueueEmpty:
@@ -149,6 +164,11 @@ class TTSAudioTrack(AudioStreamTrack):
             frame.sample_rate = WEBRTC_SAMPLE_RATE
             await self._queue.put(frame)
             offset += SAMPLES_PER_FRAME
+
+    async def drain(self) -> None:
+        """Wait until all queued audio frames have been sent via recv()."""
+        while not self._queue.empty():
+            await asyncio.sleep(0.05)
 
     def clear_queue(self) -> None:
         """Discard queued audio (for interruption handling)."""

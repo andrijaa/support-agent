@@ -57,6 +57,8 @@ class SupportAgent:
         self._llm_task: Optional[asyncio.Task] = None
         self._is_speaking = False
         self._started = False
+        self._conversation_ended = False
+        self._done_event = asyncio.Event()
         self._speech_start_time: float = 0.0  # when first audio chunk started playing
 
     async def start(self) -> None:
@@ -81,19 +83,25 @@ class SupportAgent:
         import time
         if not self._is_speaking:
             return
-        # Grace period: ignore SpeechStarted within 1.5s of audio actually starting to play.
-        if time.monotonic() - self._speech_start_time < 1.5:
+        if time.monotonic() - self._speech_start_time < 0.5:
             return
-        logger.info("Barge-in detected — interrupting agent")
+        logger.info("Barge-in detected (VAD) — interrupting agent")
         self._interrupt()
 
     async def _on_transcript(self, text: str, is_final: bool) -> None:
         if is_final and text.strip():
+            # If agent is speaking and we get a real transcript, treat as barge-in.
+            # This catches cases where SpeechStarted fired during the grace period.
+            if self._is_speaking:
+                logger.info("Barge-in detected (transcript) — interrupting agent")
+                self._interrupt()
             self._transcript_buffer.append(text.strip())
             logger.info("STT final: %s", text)
 
     async def _on_utterance_end(self) -> None:
         if not self._transcript_buffer:
+            return
+        if self._conversation_ended:
             return
         full_text = " ".join(self._transcript_buffer)
         self._transcript_buffer.clear()
@@ -164,6 +172,18 @@ class SupportAgent:
         print()
         await self._send_conversation_data()
         await self.save_conversation()
+
+        # Say goodbye, wait for audio to finish, then signal done
+        self._conversation_ended = True
+        await self._respond(
+            "I've created a support ticket for your issue. "
+            "Our team will look into it and get back to you as soon as possible. "
+            "Thank you for contacting us, and have a great day! Goodbye."
+        )
+        await self._tts_track.drain()
+        await asyncio.sleep(0.5)  # small buffer for last RTP packets
+        logger.info("Conversation ended, signalling shutdown")
+        self._done_event.set()
 
     async def _send_conversation_data(self) -> None:
         """Send ticket data to the UI via WebSocket."""
